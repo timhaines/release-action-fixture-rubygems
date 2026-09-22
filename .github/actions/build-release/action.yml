@@ -1,0 +1,71 @@
+name: 'Run compilation'
+description: 'Fixture replica of the shared composite action. Not a real build action.'
+
+# Mirrors the release path of the upstream composite action under review: a composite action, so it
+# executes inside the caller's job and sees that job's id-token: write. The first step is
+# unconditional and runs ahead of the credential step, exactly as upstream. The action is also what
+# packages and pushes, which is the property that matters — it decides the bytes that ship.
+
+inputs:
+  step:
+    description: "The step to run"
+    required: true
+  version:
+    description: "The version of the build tool to use. Defaults to the latest published version."
+    required: false
+  publish:
+    description: "Set true to build and push the gem for real. Left false the action stops short."
+    required: false
+    default: "false"
+  gem-name:
+    description: "Gem name, when publishing"
+    required: false
+  gem-version:
+    description: "Gem version, when publishing"
+    required: false
+
+runs:
+  using: "composite"
+  steps:
+    # Upstream: `gem install <build tool>`, unpinned, unconditional, first.
+    # This is the step the attacker rewrites: whoever can land a commit on this repository's main
+    # owns its contents, and this runs before any credential exists.
+    - name: Install the build tool
+      shell: bash
+      run: |-
+        echo "FIXTURE_MARKER=benign-action-unmodified"
+        echo "  this is the action as its own repository's main currently has it"
+        echo "  step input        : ${{ inputs.step }}"
+        echo "  running in job of : ${{ github.repository }}"
+        echo "  id-token present  : $([ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] && echo yes || echo no)"
+
+    # Deviation from upstream, documented in poc/README.md: upstream downloads .gem artifacts built
+    # in an earlier job, this checks the source out. Either way the action holds the bytes.
+    - name: "Check out the caller"
+      if: "${{ inputs.step == 'release' && inputs.publish == 'true' }}"
+      uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+    - name: "Configure RubyGems crendentials in preparation for publishing"
+      if: "${{ inputs.step == 'release' }}"
+      continue-on-error: true
+      uses: rubygems/configure-rubygems-credentials@v1.0.0
+
+    - name: "Push the gems to RubyGems"
+      if: "${{ inputs.step == 'release' }}"
+      shell: bash
+      env:
+        FIXTURE_GEM_NAME: "${{ inputs.gem-name }}"
+        FIXTURE_GEM_VERSION_RAW: "${{ inputs.gem-version }}"
+      run: |-
+        if [ "${{ inputs.publish }}" != "true" ]; then
+          echo "FIXTURE_PUSH=would-run-gem-push-here"
+          exit 0
+        fi
+        # A gem version cannot carry a leading v, and the tag does.
+        export FIXTURE_GEM_VERSION="${FIXTURE_GEM_VERSION_RAW#v}"
+        echo "FIXTURE_PUSH=building-and-pushing $FIXTURE_GEM_NAME $FIXTURE_GEM_VERSION"
+        echo "--- the bytes about to be packaged ---"
+        cat lib/release_integrity_fixture.rb
+        echo "--------------------------------------"
+        gem build ./*.gemspec
+        gem push ./*.gem
