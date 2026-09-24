@@ -1,90 +1,65 @@
-name: 'Run compilation'
-description: 'Fixture replica of the shared composite action. Not a real build action.'
-
-# Mirrors the release path of the upstream composite action under review: a composite action, so it
-# executes inside the caller's job and sees that job's id-token: write. The first step is
-# unconditional and runs ahead of the credential step, exactly as upstream. The action is also what
-# packages and pushes, which is the property that matters — it decides the bytes that ship.
+name: "Build and release the fixture gem"
+description: "Exact artifact-path fixture for a mutable cross-repository composite action."
 
 inputs:
   step:
-    description: "The step to run"
     required: true
-  version:
-    description: "The version of the build tool to use. Defaults to the latest published version."
-    required: false
-  publish:
-    description: "Set true to build and push the gem for real. Left false the action stops short."
-    required: false
-    default: "false"
+    description: "compile or release"
   gem-name:
-    description: "Gem name, when publishing"
-    required: false
+    required: true
+    description: "Fixture gem name"
   gem-version:
-    description: "Gem version, when publishing"
-    required: false
+    required: true
+    description: "Fixture gem version, with or without a leading v"
 
 runs:
-  using: "composite"
+  using: composite
   steps:
-    # Upstream: `gem install <build tool>`, unpinned, unconditional, first.
-    # This is the step the attacker rewrites: whoever can land a commit on this repository's main
-    # owns its contents, and this runs before any credential exists.
-    - name: Install the build tool
+    - name: "Record the resolved action"
       shell: bash
-      run: |-
-        echo "FIXTURE_MARKER=attacker-controlled-code-ran"
-        echo "  this step is the FIRST step of the composite action, and it runs"
-        echo "  before the configure-rubygems-credentials step below it."
-        # The publishing identity is an OIDC token this job can mint on demand. Minting one
-        # with the registry's audience shows the injected code holds it. The raw token is a
-        # credential and is never printed; only its decoded, non-secret claims are.
-        CLAIMS=$(curl -sf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-          "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=rubygems.org" \
-          | python3 -c 'import sys,json,base64; t=json.load(sys.stdin)["value"].split("."); p=t[1]+"="*(-len(t[1])%4); c=json.loads(base64.urlsafe_b64decode(p)); print(json.dumps({k:c.get(k) for k in ("iss","aud","repository","repository_owner","job_workflow_ref","environment","ref","event_name")}, indent=2))' 2>/dev/null)
-        if [ -n "$CLAIMS" ]; then
-          echo "FIXTURE_OIDC_CLAIMS_BEGIN"
-          echo "$CLAIMS"
-          echo "FIXTURE_OIDC_CLAIMS_END"
-        else
-          echo "FIXTURE_OIDC=unavailable"
-        fi
-        echo "  this is the action as its own repository's main currently has it"
-        echo "  step input        : ${{ inputs.step }}"
-        echo "  running in job of : ${{ github.repository }}"
-        echo "  id-token present  : $([ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] && echo yes || echo no)"
+      run: |
+        echo "EXACT_ARTIFACT_ACTION=attacker-controlled"
+        echo "EXACT_ARTIFACT_STEP=${{ inputs.step }}"
 
-    # Deviation from upstream, documented in poc/README.md: upstream downloads .gem artifacts built
-    # in an earlier job, this checks the source out. Either way the action holds the bytes.
-    - name: "Check out the caller"
-      if: "${{ inputs.step == 'release' && inputs.publish == 'true' }}"
-      uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
-
-    - name: "Configure RubyGems crendentials in preparation for publishing"
-      if: "${{ inputs.step == 'release' }}"
-      continue-on-error: true
-      uses: rubygems/configure-rubygems-credentials@v1.0.0
-
-    - name: "Push the gems to RubyGems"
-      if: "${{ inputs.step == 'release' }}"
+    - name: "Build the attacker-modified gem"
+      if: inputs.step == 'compile'
       shell: bash
       env:
         FIXTURE_GEM_NAME: "${{ inputs.gem-name }}"
         FIXTURE_GEM_VERSION_RAW: "${{ inputs.gem-version }}"
-      run: |-
-        if [ "${{ inputs.publish }}" != "true" ]; then
-          echo "FIXTURE_PUSH=would-run-gem-push-here"
-          exit 0
-        fi
-        # A gem version cannot carry a leading v, and the tag does.
+      run: |
+        set -euo pipefail
         export FIXTURE_GEM_VERSION="${FIXTURE_GEM_VERSION_RAW#v}"
-        echo "FIXTURE_PUSH=building-and-pushing $FIXTURE_GEM_NAME $FIXTURE_GEM_VERSION"
-        echo "--- the bytes about to be packaged ---"
-        cat lib/release_integrity_fixture.rb
-        echo "--------------------------------------"
-        printf '\nmodule ReleaseIntegrityFixture\n  TAMPERED = "this line was never in the approved tree"\nend\n' >> lib/release_integrity_fixture.rb
-        echo "--- what the action actually packaged ---"
-        cat lib/release_integrity_fixture.rb
-        echo "-----------------------------------------"
-        gem build ./*.gemspec
-        gem push ./*.gem
+        printf '\nmodule ReleaseIntegrityFixture\n  EXACT_ARTIFACT_PARITY = "added-by-mutable-action"\nend\n' >> lib/release_integrity_fixture.rb
+        mkdir -p pkg
+        gem_file="$FIXTURE_GEM_NAME-$FIXTURE_GEM_VERSION.gem"
+        gem build ./*.gemspec --output "pkg/$gem_file"
+        shasum -a 256 "pkg/$gem_file"
+
+    - name: "Upload the compiled gem"
+      if: inputs.step == 'compile'
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      with:
+        name: built-gem
+        path: pkg/*.gem
+        if-no-files-found: error
+        retention-days: 1
+
+    - name: "Download the compiled gem"
+      if: inputs.step == 'release'
+      uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+      with:
+        name: built-gem
+        path: pkg
+
+    - name: "Configure RubyGems credentials"
+      if: inputs.step == 'release'
+      uses: rubygems/configure-rubygems-credentials@v1.0.0
+
+    - name: "Publish the exact compiled artifact"
+      if: inputs.step == 'release'
+      shell: bash
+      run: |
+        set -euo pipefail
+        shasum -a 256 pkg/*.gem
+        gem push pkg/*.gem
