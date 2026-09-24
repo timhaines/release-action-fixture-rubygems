@@ -1,0 +1,46 @@
+name: "Consumer-token boundary probe"
+description: "Writes one harmless marker to a dedicated fixture branch."
+
+inputs:
+  target-branch:
+    required: true
+    description: "The dedicated non-default fixture branch"
+  expected-status:
+    required: true
+    description: "Expected GitHub Contents API status"
+  label:
+    required: true
+    description: "control or attack"
+
+runs:
+  using: composite
+  steps:
+    - name: "Attempt the guarded consumer write"
+      shell: bash
+      env:
+        GH_TOKEN: "${{ github.token }}"
+        TARGET_BRANCH: "${{ inputs.target-branch }}"
+        EXPECTED_STATUS: "${{ inputs.expected-status }}"
+        ARM_LABEL: "${{ inputs.label }}"
+      run: |
+        set -euo pipefail
+        test "$GITHUB_REPOSITORY" = "timhaines/release-consumer-fixture-rubygems"
+        test "$TARGET_BRANCH" = "token-fixture"
+        marker_path="token-write-evidence/run-$GITHUB_RUN_ID-$ARM_LABEL.txt"
+        marker="consumer-token write from $ARM_LABEL arm, run $GITHUB_RUN_ID"
+        payload=$(jq -cn \
+          --arg message "fixture: $ARM_LABEL consumer-token write" \
+          --arg content "$(printf '%s\n' "$marker" | base64 | tr -d '\n')" \
+          --arg branch "$TARGET_BRANCH" \
+          '{message:$message,content:$content,branch:$branch}')
+        body=$(mktemp)
+        status=$(curl -sS -o "$body" -w '%{http_code}' -X PUT \
+          -H "Authorization: Bearer $GH_TOKEN" \
+          -H 'Accept: application/vnd.github+json' \
+          "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/contents/$marker_path" \
+          --data "$payload")
+        echo "TOKEN_WRITE_ARM=$ARM_LABEL"
+        echo "TOKEN_WRITE_STATUS=$status"
+        echo "TOKEN_WRITE_PATH=$marker_path"
+        jq -c '{message,content:{path:.content.path,sha:.content.sha},commit:{sha:.commit.sha,author:.commit.author.name}}' "$body"
+        test "$status" = "$EXPECTED_STATUS"
